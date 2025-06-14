@@ -4,14 +4,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchvision.transforms import Compose, Resize, ToTensor
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 import numpy as np
 from sklearn.metrics import precision_score, recall_score, f1_score
 
+# Import custom modules
 from datasets.cutin_sequence_dataset import CutInSequenceDataset
 from models.optimized_model import OptimizedCutInDetectionModel
 from utils.hungarian_matcher import HungarianMatcher
 from utils.focal_loss import FocalLoss, WeightedBCELoss
+from utils.collate_fn import custom_collate_fn
 
 class OptimizedLoss(nn.Module):
     """Loss module for optimized cut-in detection."""
@@ -37,20 +39,28 @@ class OptimizedLoss(nn.Module):
         # Classification loss with focal loss
         src_logits = outputs['pred_logits']
         target_classes = self._get_target_classes(targets, indices, src_logits.shape[0])
-        loss_dict['loss_ce'] = self.focal_loss(src_logits.transpose(1, 2), target_classes)
+        target_classes = target_classes.to(src_logits.device)
+        
+        # Reshape for focal loss
+        src_logits_flat = src_logits.view(-1, src_logits.shape[-1])
+        target_classes_flat = target_classes.view(-1)
+        
+        loss_dict['loss_ce'] = self.focal_loss(src_logits_flat, target_classes_flat)
         
         # Bbox loss
         src_boxes = outputs['pred_boxes']
-        target_boxes = self._get_target_boxes(targets, indices)
-        if target_boxes.numel() > 0:
-            loss_dict['loss_bbox'] = self.bbox_loss(src_boxes, target_boxes)
+        target_boxes, src_indices = self._get_target_boxes(targets, indices, src_boxes.device)
+        
+        if target_boxes.numel() > 0 and len(src_indices) > 0:
+            selected_src_boxes = src_boxes.view(-1, 4)[src_indices]
+            loss_dict['loss_bbox'] = self.bbox_loss(selected_src_boxes, target_boxes)
         else:
             loss_dict['loss_bbox'] = torch.tensor(0.0, device=src_boxes.device)
         
         # Cut-in loss with heavy weighting for true cases
         src_cutin = outputs['pred_cutin']
-        target_cutin = self._get_target_cutin(targets, indices, src_cutin.shape)
-        loss_dict['loss_cutin'] = self.cutin_loss(src_cutin, target_cutin)
+        target_cutin = self._get_target_cutin(targets, indices, src_cutin.shape, src_cutin.device)
+        loss_dict['loss_cutin'] = self.cutin_loss(src_cutin.view(-1), target_cutin.view(-1))
         
         # Total loss
         total_loss = (loss_dict['loss_ce'] + 
@@ -67,20 +77,25 @@ class OptimizedLoss(nn.Module):
                 target_classes[i, src_idx] = targets[i]['labels'][tgt_idx]
         return target_classes
     
-    def _get_target_boxes(self, targets, indices):
-        # Implementation for target box extraction
+    def _get_target_boxes(self, targets, indices, device):
         target_boxes = []
+        src_indices = []
+        batch_offset = 0
+        
         for i, (src_idx, tgt_idx) in enumerate(indices):
             if len(tgt_idx) > 0:
                 target_boxes.append(targets[i]['boxes'][tgt_idx])
+                src_indices.extend((src_idx + batch_offset * 100).tolist())
+            batch_offset += 1
+            
         if target_boxes:
-            return torch.cat(target_boxes)
-        return torch.empty(0, 4)
+            return torch.cat(target_boxes).to(device), src_indices
+        return torch.empty(0, 4).to(device), []
     
-    def _get_target_cutin(self, targets, indices, shape):
-        target_cutin = torch.zeros(shape, dtype=torch.float32)
+    def _get_target_cutin(self, targets, indices, shape, device):
+        target_cutin = torch.zeros(shape, dtype=torch.float32, device=device)
         for i, (src_idx, tgt_idx) in enumerate(indices):
-            if len(tgt_idx) > 0:
+            if len(tgt_idx) > 0 and len(targets[i]['cutting']) > 0:
                 target_cutin[i, src_idx] = targets[i]['cutting'][tgt_idx].float()
         return target_cutin
 
@@ -131,21 +146,26 @@ def convert_annotations_to_targets(annotations_batch):
 
 def compute_metrics(outputs, targets, threshold=0.5):
     """Compute precision, recall, F1 for cut-in detection"""
-    pred_cutin = (outputs['pred_cutin'] > threshold).cpu().numpy()
+    pred_cutin = (torch.sigmoid(outputs['pred_cutin']) > threshold).cpu().numpy()
     true_cutin = []
     
     for target in targets:
         if len(target['cutting']) > 0:
             true_cutin.extend(target['cutting'].cpu().numpy())
         else:
-            true_cutin.extend([False] * pred_cutin.shape[1])
+            # Add false entries for padding
+            true_cutin.extend([False] * 100)  # num_queries
     
-    true_cutin = np.array(true_cutin[:pred_cutin.size])
-    pred_cutin = pred_cutin.flatten()[:len(true_cutin)]
+    # Flatten and match sizes
+    pred_cutin_flat = pred_cutin.flatten()
+    true_cutin = np.array(true_cutin[:len(pred_cutin_flat)])
     
-    precision = precision_score(true_cutin, pred_cutin, zero_division=0)
-    recall = recall_score(true_cutin, pred_cutin, zero_division=0)
-    f1 = f1_score(true_cutin, pred_cutin, zero_division=0)
+    if len(true_cutin) == 0:
+        return 0.0, 0.0, 0.0
+    
+    precision = precision_score(true_cutin, pred_cutin_flat, zero_division=0)
+    recall = recall_score(true_cutin, pred_cutin_flat, zero_division=0)
+    f1 = f1_score(true_cutin, pred_cutin_flat, zero_division=0)
     
     return precision, recall, f1
 
@@ -157,37 +177,42 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     total_f1 = 0
     
     for i, (images, annotations) in enumerate(dataloader):
-        images = images.to(device)
-        targets = convert_annotations_to_targets(annotations)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        
-        optimizer.zero_grad()
-        outputs = model(images, annotations)
-        loss_dict = criterion(outputs, targets)
-        
-        loss = loss_dict['total_loss']
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        
-        # Compute metrics
-        precision, recall, f1 = compute_metrics(outputs, targets)
-        
-        total_loss += loss.item()
-        total_precision += precision
-        total_recall += recall
-        total_f1 += f1
-        
-        if i % 10 == 0:
-            print(f"Epoch {epoch}, Step {i}")
-            print(f"  Loss: {loss.item():.4f}")
-            print(f"  CE: {loss_dict['loss_ce'].item():.4f}")
-            print(f"  BBox: {loss_dict['loss_bbox'].item():.4f}")
-            print(f"  CutIn: {loss_dict['loss_cutin'].item():.4f}")
-            print(f"  Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+        try:
+            images = images.to(device)
+            targets = convert_annotations_to_targets(annotations)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            optimizer.zero_grad()
+            outputs = model(images, annotations)
+            loss_dict = criterion(outputs, targets)
+            
+            loss = loss_dict['total_loss']
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            # Compute metrics
+            precision, recall, f1 = compute_metrics(outputs, targets)
+            
+            total_loss += loss.item()
+            total_precision += precision
+            total_recall += recall
+            total_f1 += f1
+            
+            if i % 10 == 0:
+                print(f"Epoch {epoch}, Step {i}")
+                print(f"  Loss: {loss.item():.4f}")
+                print(f"  CE: {loss_dict['loss_ce'].item():.4f}")
+                print(f"  BBox: {loss_dict['loss_bbox'].item():.4f}")
+                print(f"  CutIn: {loss_dict['loss_cutin'].item():.4f}")
+                print(f"  Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+                
+        except Exception as e:
+            print(f"Error in batch {i}: {e}")
+            continue
     
     return {
         'loss': total_loss / len(dataloader),
@@ -197,14 +222,33 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     }
 
 def main():
-    # Dataset and DataLoader
+    # Dataset and DataLoader with custom collate function
     root_dir = "/content/distribution/Train"
-    transform = Compose([Resize((224, 224)), ToTensor()])
+    
+    # Enhanced transforms with normalization
+    transform = Compose([
+        Resize((224, 224)),
+        ToTensor(),
+        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
     dataset = CutInSequenceDataset(root_dir=root_dir, transform=transform, sequence_length=5)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
+    
+    # Use custom collate function to handle variable sequence lengths
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=2,  # Reduced batch size for stability
+        shuffle=True, 
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
+        collate_fn=custom_collate_fn
+    )
+    
+    print(f"Dataset loaded with {len(dataset)} sequences")
     
     # Model and training components
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
     model = OptimizedCutInDetectionModel(num_classes=4).to(device)
     
     matcher = HungarianMatcher()
@@ -217,6 +261,7 @@ def main():
     # Training loop
     best_f1 = 0
     for epoch in range(20):
+        print(f"\nStarting Epoch {epoch}")
         metrics = train_epoch(model, dataloader, optimizer, criterion, device, epoch)
         
         print(f"\nEpoch {epoch} Summary:")
