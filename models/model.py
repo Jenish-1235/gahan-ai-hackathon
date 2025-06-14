@@ -1,5 +1,7 @@
-# Full model wrapper (e.g., in model.py)
+import torch
+import torch.nn as nn
 from models.vit_backbone import ViTBackbone
+from models.gru_temporal_encoder import GRUTemporalEncoder
 from models.gru_temporal_encoder import GRUTemporalEncoder
 from models.detr_decoder import DETRDecoder
 import torch.nn as nn
