@@ -5,72 +5,233 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, Resize, ToTensor
-
-# Ensure consistent absolute path for Colab and CLI
-SRC_DIR = '/content/src'
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 from datasets.cutin_sequence_dataset import CutInSequenceDataset
-from models.model import CutInDetectionModel
+from models.optimized_model import OptimizedCutInDetectionModel
+from utils.hungarian_matcher import HungarianMatcher
+from utils.focal_loss import FocalLoss, WeightedBCELoss
 
-def collate_fn(batch):
-    images, annotations = zip(*batch)
-    return torch.stack(images), annotations
+class OptimizedLoss(nn.Module):
+    """Loss module for optimized cut-in detection."""
 
-def compute_loss(pred_class, pred_bbox, pred_cutin, targets, criterion_cls, criterion_bbox, criterion_cutin):
-    # Placeholder: match predictions to targets by IoU (Hungarian matching if needed)
-    # For now, assume targets are aligned with predictions
-    # Add your matcher here if necessary
+    def __init__(self, matcher, num_classes=4, cutin_weight=10.0):
+        super().__init__()
+        self.matcher = matcher
+        self.num_classes = num_classes
+        self.cutin_weight = cutin_weight
+        
+        # Class imbalance handling
+        self.focal_loss = FocalLoss(alpha=1, gamma=2)
+        self.bbox_loss = nn.L1Loss()
+        self.cutin_loss = WeightedBCELoss(pos_weight=cutin_weight)
+        
+    def forward(self, outputs, targets):
+        """Compute the loss given model outputs and targets."""
+        indices = self.matcher(outputs, targets)
+        
+        # Compute losses
+        loss_dict = {}
+        
+        # Classification loss with focal loss
+        src_logits = outputs['pred_logits']
+        target_classes = self._get_target_classes(targets, indices, src_logits.shape[0])
+        loss_dict['loss_ce'] = self.focal_loss(src_logits.transpose(1, 2), target_classes)
+        
+        # Bbox loss
+        src_boxes = outputs['pred_boxes']
+        target_boxes = self._get_target_boxes(targets, indices)
+        if target_boxes.numel() > 0:
+            loss_dict['loss_bbox'] = self.bbox_loss(src_boxes, target_boxes)
+        else:
+            loss_dict['loss_bbox'] = torch.tensor(0.0, device=src_boxes.device)
+        
+        # Cut-in loss with heavy weighting for true cases
+        src_cutin = outputs['pred_cutin']
+        target_cutin = self._get_target_cutin(targets, indices, src_cutin.shape)
+        loss_dict['loss_cutin'] = self.cutin_loss(src_cutin, target_cutin)
+        
+        # Total loss
+        total_loss = (loss_dict['loss_ce'] + 
+                     5 * loss_dict['loss_bbox'] + 
+                     self.cutin_weight * loss_dict['loss_cutin'])
+        
+        loss_dict['total_loss'] = total_loss
+        return loss_dict
+    
+    def _get_target_classes(self, targets, indices, batch_size):
+        target_classes = torch.full((batch_size, 100), self.num_classes, dtype=torch.int64)
+        for i, (src_idx, tgt_idx) in enumerate(indices):
+            if len(tgt_idx) > 0:
+                target_classes[i, src_idx] = targets[i]['labels'][tgt_idx]
+        return target_classes
+    
+    def _get_target_boxes(self, targets, indices):
+        # Implementation for target box extraction
+        target_boxes = []
+        for i, (src_idx, tgt_idx) in enumerate(indices):
+            if len(tgt_idx) > 0:
+                target_boxes.append(targets[i]['boxes'][tgt_idx])
+        if target_boxes:
+            return torch.cat(target_boxes)
+        return torch.empty(0, 4)
+    
+    def _get_target_cutin(self, targets, indices, shape):
+        target_cutin = torch.zeros(shape, dtype=torch.float32)
+        for i, (src_idx, tgt_idx) in enumerate(indices):
+            if len(tgt_idx) > 0:
+                target_cutin[i, src_idx] = targets[i]['cutting'][tgt_idx].float()
+        return target_cutin
 
-    cls_loss = criterion_cls(pred_class.view(-1, pred_class.size(-1)), targets['class'].view(-1))
-    bbox_loss = criterion_bbox(pred_bbox.view(-1, 4), targets['bbox'].view(-1, 4))
-    cutin_loss = criterion_cutin(pred_cutin.view(-1), targets['cutin'].float().view(-1))
+def convert_annotations_to_targets(annotations_batch):
+    """Convert dataset annotations to model target format"""
+    targets = []
+    
+    for sequence_annotations in annotations_batch:
+        # Use last frame annotations for sequence-level prediction
+        last_frame_ann = sequence_annotations[-1] if sequence_annotations else []
+        
+        if not last_frame_ann:
+            targets.append({
+                'labels': torch.empty(0, dtype=torch.long),
+                'boxes': torch.empty(0, 4),
+                'cutting': torch.empty(0, dtype=torch.bool)
+            })
+            continue
+        
+        labels = []
+        boxes = []
+        cutting = []
+        
+        # Map object names to class indices
+        class_map = {'EgoVehicle': 0, 'Bicycle': 1, 'MotorBike': 2, 'Car': 3}
+        
+        for obj in last_frame_ann:
+            if obj['label'] in class_map:
+                labels.append(class_map[obj['label']])
+                # Normalize bounding boxes
+                bbox = obj['bbox']
+                normalized_bbox = [
+                    bbox[0] / 1920,  # xmin
+                    bbox[1] / 1080,  # ymin  
+                    bbox[2] / 1920,  # xmax
+                    bbox[3] / 1080   # ymax
+                ]
+                boxes.append(normalized_bbox)
+                cutting.append(obj['cutting'])
+        
+        targets.append({
+            'labels': torch.tensor(labels, dtype=torch.long),
+            'boxes': torch.tensor(boxes, dtype=torch.float32),
+            'cutting': torch.tensor(cutting, dtype=torch.bool)
+        })
+    
+    return targets
 
-    total = cls_loss + bbox_loss + cutin_loss
-    return total, cls_loss, bbox_loss, cutin_loss
+def compute_metrics(outputs, targets, threshold=0.5):
+    """Compute precision, recall, F1 for cut-in detection"""
+    pred_cutin = (outputs['pred_cutin'] > threshold).cpu().numpy()
+    true_cutin = []
+    
+    for target in targets:
+        if len(target['cutting']) > 0:
+            true_cutin.extend(target['cutting'].cpu().numpy())
+        else:
+            true_cutin.extend([False] * pred_cutin.shape[1])
+    
+    true_cutin = np.array(true_cutin[:pred_cutin.size])
+    pred_cutin = pred_cutin.flatten()[:len(true_cutin)]
+    
+    precision = precision_score(true_cutin, pred_cutin, zero_division=0)
+    recall = recall_score(true_cutin, pred_cutin, zero_division=0)
+    f1 = f1_score(true_cutin, pred_cutin, zero_division=0)
+    
+    return precision, recall, f1
 
-def train(model, dataloader, optimizer, device):
+def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     model.train()
-    model.to(device)
-
-    criterion_cls = nn.CrossEntropyLoss()
-    criterion_bbox = nn.L1Loss()
-    criterion_cutin = nn.BCELoss()
-
-    for i, (images, targets) in enumerate(dataloader):
-        images = images.to(device)  # (B, T, C, H, W)
-        # Placeholder: Convert targets to tensors
-        dummy_targets = {
-            'class': torch.randint(0, 4, (images.size(0), 100)).to(device),
-            'bbox': torch.rand(images.size(0), 100, 4).to(device),
-            'cutin': torch.randint(0, 2, (images.size(0), 100)).to(device)
-        }
-
+    total_loss = 0
+    total_precision = 0
+    total_recall = 0
+    total_f1 = 0
+    
+    for i, (images, annotations) in enumerate(dataloader):
+        images = images.to(device)
+        targets = convert_annotations_to_targets(annotations)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        
         optimizer.zero_grad()
-        pred_class, pred_bbox, pred_cutin = model(images)
-        loss, cls_loss, bbox_loss, cutin_loss = compute_loss(
-            pred_class, pred_bbox, pred_cutin, dummy_targets,
-            criterion_cls, criterion_bbox, criterion_cutin
-        )
-
+        outputs = model(images, annotations)
+        loss_dict = criterion(outputs, targets)
+        
+        loss = loss_dict['total_loss']
         loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
-
+        
+        # Compute metrics
+        precision, recall, f1 = compute_metrics(outputs, targets)
+        
+        total_loss += loss.item()
+        total_precision += precision
+        total_recall += recall
+        total_f1 += f1
+        
         if i % 10 == 0:
-            print(f"Step {i}, Loss: {loss.item():.4f}, Cls: {cls_loss.item():.4f}, BBox: {bbox_loss.item():.4f}, CutIn: {cutin_loss.item():.4f}")
+            print(f"Epoch {epoch}, Step {i}")
+            print(f"  Loss: {loss.item():.4f}")
+            print(f"  CE: {loss_dict['loss_ce'].item():.4f}")
+            print(f"  BBox: {loss_dict['loss_bbox'].item():.4f}")
+            print(f"  CutIn: {loss_dict['loss_cutin'].item():.4f}")
+            print(f"  Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+    
+    return {
+        'loss': total_loss / len(dataloader),
+        'precision': total_precision / len(dataloader),
+        'recall': total_recall / len(dataloader),
+        'f1': total_f1 / len(dataloader)
+    }
 
 def main():
+    # Dataset and DataLoader
     root_dir = "/content/distribution/Train"
-    transform = Compose([Resize((224,224)), ToTensor()])
-    dataset = CutInSequenceDataset(root_dir=root_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
-
-    model = CutInDetectionModel()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    transform = Compose([Resize((224, 224)), ToTensor()])
+    dataset = CutInSequenceDataset(root_dir=root_dir, transform=transform, sequence_length=5)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
+    
+    # Model and training components
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    train(model, dataloader, optimizer, device)
+    model = OptimizedCutInDetectionModel(num_classes=4).to(device)
+    
+    matcher = HungarianMatcher()
+    criterion = OptimizedLoss(matcher, num_classes=4, cutin_weight=15.0)
+    
+    # Optimizer with weight decay and learning rate scheduling
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+    
+    # Training loop
+    best_f1 = 0
+    for epoch in range(20):
+        metrics = train_epoch(model, dataloader, optimizer, criterion, device, epoch)
+        
+        print(f"\nEpoch {epoch} Summary:")
+        print(f"  Average Loss: {metrics['loss']:.4f}")
+        print(f"  Average Precision: {metrics['precision']:.4f}")
+        print(f"  Average Recall: {metrics['recall']:.4f}")
+        print(f"  Average F1: {metrics['f1']:.4f}")
+        
+        scheduler.step(metrics['loss'])
+        
+        # Save best model
+        if metrics['f1'] > best_f1:
+            best_f1 = metrics['f1']
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f"  New best F1 score: {best_f1:.4f} - Model saved!")
 
 if __name__ == '__main__':
     main()
