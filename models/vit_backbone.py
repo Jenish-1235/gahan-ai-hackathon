@@ -1,45 +1,36 @@
-# vit_backbone.py
 import torch
 import torch.nn as nn
-from torchvision.models.vision_transformer import vit_l_16, ViT_L_16_Weights
-import torch.nn.functional as F
+
+try:
+    import timm
+except ImportError:
+    raise ImportError("Please install timm: pip install timm")
 
 class ViTBackbone(nn.Module):
-    def __init__(self, pretrained=True, output_dim=768):
+    """
+    Vision Transformer backbone for feature extraction.
+    Outputs a sequence of patch embeddings for each image.
+    """
+    def __init__(self, model_name="vit_base_patch16_224_in21k", pretrained=True, output_dim=768):
         super().__init__()
-        # Use ViT-Large for better performance
-        weights = ViT_L_16_Weights.DEFAULT if pretrained else None
-        vit = vit_l_16(weights=weights)
-        
+        self.vit = timm.create_model(model_name, pretrained=pretrained)
         # Remove the classification head
-        self.backbone = vit
-        self.backbone.heads = nn.Identity()
-        
-        # Feature enhancement layers
-        self.feature_enhancer = nn.Sequential(
-            nn.Linear(1024, output_dim),  # ViT-L has 1024 dim
-            nn.LayerNorm(output_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
-        # Spatial attention for ROI focus
-        self.spatial_attention = nn.Sequential(
-            nn.Linear(output_dim, output_dim // 4),
-            nn.ReLU(),
-            nn.Linear(output_dim // 4, 1),
-            nn.Sigmoid()
-        )
+        if hasattr(self.vit, 'head'):
+            self.vit.head = nn.Identity()
+        elif hasattr(self.vit, 'fc'):
+            self.vit.fc = nn.Identity()
+        self.output_dim = output_dim
 
     def forward(self, x):
-        # x: (B*T, 3, H, W)
-        features = self.backbone(x)  # (B*T, 1024)
-        
-        # Enhance features
-        enhanced_features = self.feature_enhancer(features)  # (B*T, output_dim)
-        
-        # Apply spatial attention (helps focus on ROI)
-        attention_weights = self.spatial_attention(enhanced_features)  # (B*T, 1)
-        attended_features = enhanced_features * attention_weights  # (B*T, output_dim)
-        
-        return attended_features
+        """
+        Args:
+            x: Tensor of shape (B, C, H, W)
+        Returns:
+            features: Tensor of shape (B, N_patches, output_dim)
+        """
+        # timm ViT models output (B, N_patches+1, D), first token is [CLS]
+        features = self.vit.forward_features(x)
+        # Remove [CLS] token if present
+        if features.dim() == 3 and features.shape[1] > 1:
+            features = features[:, 1:, :]
+        return features  # (B, N_patches, output_dim)

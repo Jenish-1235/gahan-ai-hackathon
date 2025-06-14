@@ -1,0 +1,61 @@
+# Dataset Configuration
+data_root: "/content/distribution/" # Base path to your dataset
+train_dir: "Train"
+val_dir: "Val"
+test_dir: "Test"
+annotation_folder_name: "Annotations"
+image_extension: ".JPG" # or .PNG, .jpg as per your dataset
+xml_extension: ".xml"
+
+# Model Configuration
+vit_model_name: "vit_base_patch16_224_in21k" # Pretrained ViT model from timm
+image_size: 224
+patch_size: 16
+num_classes: 4 # Example: EgoVehicle, Bicycle, MotorBike, Car + 1 for no-object/background
+num_queries: 100 # Number of object queries for DETR
+hidden_dim: 256 # Dimension for DETR transformer and GRU
+nheads: 8 # Number of attention heads in DETR transformer
+num_encoder_layers: 6 # DETR encoder layers (if using full DETR, ViT acts as encoder here)
+num_decoder_layers: 6 # DETR decoder layers
+gru_hidden_dim: 256
+gru_num_layers: 2
+gru_dropout: 0.1
+temporal_attention_heads: 4
+
+# Training Configuration
+sequence_length: 5 # Number of frames per sequence
+batch_size: 4 # Adjust based on TPU/GPU memory
+learning_rate: 0.0001
+lr_backbone: 0.00001
+weight_decay: 0.0001
+epochs: 50
+clip_max_norm: 0.1 # Gradient clipping
+device: "cuda" # "cuda", "cpu", or "tpu" (will be handled in main script)
+num_workers: 2 # For DataLoader
+
+# Loss Configuration
+focal_alpha: 0.25
+focal_gamma: 2.0
+bbox_loss_coef: 5.0
+giou_loss_coef: 2.0
+ce_loss_coef: 1.0
+cutting_loss_coef: 2.0 # Higher weight for the "cutting" binary classification
+eos_coef: 0.1 # Relative weight of the no-object class
+
+# Object class mapping (ensure 'no_object' is last or handled separately)
+class_mapping:
+  EgoVehicle: 0
+  Bicycle: 1
+  MotorBike: 2
+  Car: 3
+  # Add other classes if present
+  # no_object: 4 # This will be num_classes - 1 if DETR convention is followed
+
+# Augmentations (optional, can be added later)
+augmentations:
+  random_flip: true
+  color_jitter: true
+
+# ROI Cropping (if used explicitly, otherwise ViT handles full image)
+use_roi_cropping: false # Set to true if you want to implement explicit ROI cropping
+roi_margin: 0.1
