@@ -213,3 +213,48 @@ class CutInDataset(Dataset):
 
 
         return images_sequence, targets_sequence
+
+def custom_collate_fn(batch, config):
+    """
+    Collate function to handle sequences of images and targets.
+    Pads sequences to config.sequence_length.
+
+    Args:
+        batch: A list of tuples, where each tuple is (images_sequence, targets_sequence).
+               images_sequence: A list of [C, H, W] tensors.
+               targets_sequence: A list of target dictionaries.
+        config: The experiment configuration object.
+
+    Returns:
+        batched_images: Tensor of shape (B, T, C, H, W).
+        batched_targets: A list (length B) of lists (length T) of target dictionaries.
+    """
+    images_batch = []
+    targets_batch = []
+
+    max_seq_len = config.sequence_length
+
+    for images_sequence, targets_sequence in batch:
+        # Pad Images
+        current_seq_len = len(images_sequence)
+        padded_img_seq = list(images_sequence)
+        if current_seq_len < max_seq_len:
+            last_image = images_sequence[-1] if images_sequence else torch.zeros((3, config.image_size, config.image_size), dtype=torch.float32)
+            for _ in range(max_seq_len - current_seq_len):
+                padded_img_seq.append(last_image.clone())
+        images_batch.append(torch.stack(padded_img_seq[:max_seq_len]))
+
+        # Pad Targets
+        padded_tgt_seq = list(targets_sequence)
+        if len(targets_sequence) < max_seq_len:
+            last_target = targets_sequence[-1] if targets_sequence else {
+                'labels': torch.empty(0, dtype=torch.int64),
+                'boxes': torch.empty(0, 4, dtype=torch.float32),
+                'cutting_flags': torch.empty(0, dtype=torch.bool)
+            }
+            for _ in range(max_seq_len - len(targets_sequence)):
+                padded_tgt_seq.append(last_target.copy())
+        targets_batch.append(padded_tgt_seq[:max_seq_len])
+
+    batched_images = torch.stack(images_batch)
+    return batched_images, targets_batch
