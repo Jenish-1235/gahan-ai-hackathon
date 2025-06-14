@@ -1,7 +1,4 @@
 import os
-import xml.etree.ElementTree as ET
-from PIL import Image
-from typing import List, Dict, Tuple
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -13,6 +10,7 @@ class CutInSequenceDataset(Dataset):
     def __init__(self, root_dir: str, sequence_length: int = 5, transform=None, 
                  roi_filter=True, balance_classes=True, augment=True):
         self.root_dir = root_dir
+        self.transform = transform
         self.sequence_length = sequence_length
         self.roi_filter = roi_filter
         self.balance_classes = balance_classes
@@ -128,8 +126,8 @@ class CutInSequenceDataset(Dataset):
         return balanced_samples
 
     def __len__(self):
-        return len(self.samples)
-
+        return len(self.sequences)
+    
     def __getitem__(self, idx):
         max_attempts = 10
         attempts = 0
