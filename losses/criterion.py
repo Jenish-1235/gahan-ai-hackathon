@@ -18,7 +18,7 @@ class DetectionCriterion(nn.Module):
         self.giou_loss_coef = giou_loss_coef
         self.cutting_loss_coef = cutting_loss_coef
         self.eos_coef = eos_coef
-        self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
+        self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0, ignore_index=num_classes)
         self.bbox_loss = nn.L1Loss()
         self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]))  # Heavily weight positives
 

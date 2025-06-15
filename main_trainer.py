@@ -22,7 +22,7 @@ def load_config(config_path):
     return config
 
 def main():
-    config = load_config("configs/experiment_config.yaml")
+    config = load_config("/content/jenish/gahan-ai-hackathon/configs/experiment_config.yaml")
 
     # Data transforms
     transform = transforms.Compose([
@@ -85,7 +85,7 @@ def main():
             images = images.to(device)
             outputs = model(images)
             # Move targets to device if needed
-            targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()} for t in targets]
+            targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in seq[-1].items()} for seq in targets]
             loss = criterion(outputs, targets)
             optimizer.zero_grad()
             loss.backward()

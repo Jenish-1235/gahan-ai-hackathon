@@ -15,6 +15,7 @@ class CutInDataset(Dataset):
             mode (str): 'Train', 'Val', or 'Test'.
             transform (callable, optional): Optional transform to be applied on a sample.
         """
+        self.mode = mode
         self.data_path = os.path.join(root_dir, getattr(config, f"{mode.lower()}_dir"))
         self.config = config
         self.transform = transform
@@ -23,7 +24,8 @@ class CutInDataset(Dataset):
         self.image_extension = config.image_extension
         self.xml_extension = config.xml_extension
         self.annotation_folder_name = config.annotation_folder_name
-
+        self.mode = mode  # <-- Add this line
+        self.data_path = os.path.join(root_dir, getattr(config, f"{mode.lower()}_dir"))
         self.sequences = self._load_sequences()
 
     def _load_sequences(self):
